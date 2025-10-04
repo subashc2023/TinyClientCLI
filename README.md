@@ -1,3 +1,5 @@
+![TinyClientCLI](public/image.png)
+
 uv run ./main.py
 
 

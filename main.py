@@ -9,7 +9,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from pyfiglet import figlet_format
 from rich.console import Console
+from rich.text import Text
 
 # ============================================================================
 # Config & Constants
@@ -70,9 +72,14 @@ class UI:
         width = self._safe_width(2)
         self.console.print(f"[{color}]│{'─' * width}[/{color}]")
 
-    def margin_print(self, text: str, color: str) -> None:
+    def margin_print(self, text: str, color: str, markup: bool = True) -> None:
         for line in text.splitlines():
-            self.console.print(f"[{color}]│[/{color}] {line}")
+            if markup:
+                self.console.print(f"[{color}]│[/{color}] {line}")
+            else:
+                border = Text("│ ", style=color)
+                content = Text(line)
+                self.console.print(border + content)
 
     def margin_label(self, label: str, color: str) -> None:
         self.console.print(f"[bold {color}]│[/bold {color}] [bold]{label}:[/bold]")
@@ -563,6 +570,8 @@ async def run_repl(cfg: AppConfig) -> None:
         width = max(console.width - 2, 10)
         console.print()
         console.print(f"[{COLORS['assistant']}]│{'─' * width}[/{COLORS['assistant']}]")
+        for line in figlet_format("TinyClient", font="standard").splitlines():
+            ui.margin_print(line, COLORS["assistant"], markup=False)
         ui.margin_print("A powerful, tiny MCP client for tool-enhanced conversations", COLORS["assistant"])
         for name, count in mcp.server_summaries():
             ui.margin_print(f"✓ {name}: {count} tools", COLORS["assistant"])
