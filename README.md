@@ -1,7 +1,8 @@
-![TinyClientCLI](public/image.png)
+![TinyClientCLI](https://imgur.com/a/zcgQXEe)
 
 A minimal, fully featured, hackable MCP Client, all in 500 lines of code!
 
+uv sync
 uv run ./main.py
 
 

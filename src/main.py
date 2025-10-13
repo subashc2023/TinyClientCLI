@@ -2,8 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from dataclasses import dataclass, field
+from datetime import datetime
+from difflib import get_close_matches
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -13,15 +16,18 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pyfiglet import figlet_format
 from rich.console import Console
+from rich.json import JSON
+from rich.table import Table
 from rich.text import Text
 
-from types_def import Message, ToolCall, ToolResult, Role
+from types_def import Message, ToolCall, ToolResult, Role, UsageStats, MCPResource
 
 
 DEFAULT_SYSTEM = (
     "You are TinyClient, a powerful, tiny MCP client and helpful assistant. "
     "You can call tools sequentially (waiting for each result before the next call) "
-    "or simultaneously (multiple tools in parallel when the operations are independent)."
+    "or simultaneously (multiple tools in parallel when the operations are independent). "
+    "You can also read resources when you need access to data sources."
 )
 
 TOOL_ARGS_PREVIEW_LEN = 100
@@ -37,19 +43,21 @@ class Color(Enum):
     TOOL_RESULT = "purple"
     ERROR = "red"
     INFO = "cyan"
-
+    SUCCESS = "green"
+    WARNING = "yellow"
 
 
 @dataclass
 class AppConfig:
     # Files / runtime
     config_file: Path = field(default_factory=lambda: Path(__file__).parent / "mcp_config.json")
+    save_dir: Path = field(default_factory=lambda: Path(__file__).parent / "conversations")
 
     # LLM settings
     system_prompt: str = field(default_factory=lambda: os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM))
-    model: str = field(default_factory=lambda: os.getenv("MODEL", "gpt-4o"))
-    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    base_url: str = field(default_factory=lambda: os.getenv("BASE_URL", "https://api.openai.com"))
+    model: str = field(default_factory=lambda: os.getenv("MODEL", "llama-3.3-70b-versatile"))
+    api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY", ""))
+    base_url: str = field(default_factory=lambda: os.getenv("BASE_URL", "https://api.groq.com/openai"))
 
     # Behavior knobs
     max_history_messages: int = field(default_factory=lambda: int(os.getenv("MAX_HISTORY_MESSAGES", "20")))
@@ -75,15 +83,17 @@ class AppConfig:
         if self.max_history_messages < 1:
             raise ValueError("max_history_messages must be >= 1")
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
+            raise ValueError("API key is required (set GROQ_API_KEY or OPENAI_API_KEY)")
         if self.retry_attempts < 1:
             raise ValueError("retry_attempts must be >= 1")
+
+        # Create save directory
+        self.save_dir.mkdir(exist_ok=True)
 
         logging.basicConfig(
             level=getattr(logging, self.log_level.upper()),
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-
 
 
 class UI:
@@ -182,9 +192,90 @@ class UI:
     def error(self, outer: Color, message: str) -> None:
         self.console.print(
             f"{self.nested_prefix(outer, Color.ERROR)}"
-            f"[red][??][/red] {message}"
+            f"[red][✗][/red] {message}"
         )
+    
+    def success(self, outer: Color, message: str) -> None:
+        self.console.print(
+            f"{self.nested_prefix(outer, Color.SUCCESS)}"
+            f"[green][✓][/green] {message}"
+        )
+    
+    def info(self, color: Color, message: str) -> None:
+        self.console.print(f"{self.prefix(color)}{message}")
 
+    def render_structured_data(self, outer: Color, content: str) -> None:
+        """Render JSON or table data with rich formatting."""
+        # Try JSON first
+        try:
+            data = json.loads(content)
+            self.console.print(f"{self.prefix(outer)}", end="")
+            self.console.print(JSON.from_data(data))
+            return
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # Try table detection (TSV, CSV, markdown table)
+        table = self._parse_as_table(content)
+        if table:
+            self.console.print(f"{self.prefix(outer)}", end="")
+            self.console.print(table)
+            return
+        
+        # Fall back to normal text
+        self.text(outer, content)
+    
+    def _parse_as_table(self, content: str) -> Optional[Table]:
+        """Parse content as table if it looks like one."""
+        lines = content.strip().splitlines()
+        if len(lines) < 2:
+            return None
+        
+        # Detect separator (tab, comma, or pipe)
+        first_line = lines[0]
+        separator = None
+        if '\t' in first_line:
+            separator = '\t'
+        elif '|' in first_line and first_line.count('|') >= 2:
+            separator = '|'
+        elif ',' in first_line:
+            separator = ','
+        
+        if not separator:
+            return None
+        
+        # Parse rows
+        rows = []
+        for line in lines:
+            if separator == '|':
+                # Markdown table: skip separator lines
+                if re.match(r'^\|[\s\-:]+\|$', line):
+                    continue
+                cells = [c.strip() for c in line.split('|') if c.strip()]
+            else:
+                cells = [c.strip() for c in line.split(separator)]
+            
+            if cells:
+                rows.append(cells)
+        
+        if len(rows) < 2:
+            return None
+        
+        # Create rich table
+        table = Table(show_header=True, header_style="bold")
+        
+        # Add columns from first row
+        for header in rows[0]:
+            table.add_column(header)
+        
+        # Add data rows
+        for row in rows[1:]:
+            # Pad row to match column count
+            while len(row) < len(rows[0]):
+                row.append("")
+            table.add_row(*row[:len(rows[0])])
+        
+        return table
 
 
 class MCPManager:
@@ -195,13 +286,19 @@ class MCPManager:
         self.servers: Dict[str, ClientSession] = {}
         self.transports: Dict[str, Any] = {}
         self.tools: Dict[str, Tuple[str, str, dict]] = {}
+        self.resources: Dict[str, MCPResource] = {}
     
     async def __aenter__(self):
         await self.start()
         return self
 
     async def __aexit__(self, *_):
-        await self.stop()
+        # Prevent outer task cancellation (e.g., from errors or Ctrl+C)
+        # from interrupting a clean shutdown of MCP transports/sessions.
+        try:
+            await asyncio.shield(self.stop())
+        except Exception as e:
+            logger.debug(f"Error during MCPManager shutdown: {e}")
 
     async def start(self) -> None:
         cfg_path = self.config.config_file
@@ -239,6 +336,7 @@ class MCPManager:
             self.transports[name] = transport_ctx
 
             await self._register_tools(name, session)
+            await self._register_resources(name, session)
             logger.info(f"Initialized MCP server: {name}")
 
         except Exception as e:
@@ -267,6 +365,66 @@ class MCPManager:
                 },
             )
     
+    async def _register_resources(self, server_name: str, session: ClientSession) -> None:
+        """Register available resources from MCP server."""
+        try:
+            result = await session.list_resources()
+            for resource in result.resources:
+                namespaced_uri = f"{server_name}://{resource.uri}"
+                self.resources[namespaced_uri] = MCPResource(
+                    server_name=server_name,
+                    uri=resource.uri,
+                    name=resource.name,
+                    description=resource.description,
+                    mime_type=resource.mimeType if hasattr(resource, 'mimeType') else None
+                )
+                logger.debug(f"Registered resource: {namespaced_uri}")
+        except Exception as e:
+            # Many MCP servers legitimately do not implement resources/list (-32601 Method not found).
+            # Treat that case as expected and log lower severity to avoid noisy warnings.
+            error_code = getattr(e, "code", None)
+            message = str(e)
+            if error_code == -32601 or "Method not found" in message or "resources/list" in message:
+                logger.info(f"Skipping resource registration for {server_name}: not supported ({e})")
+            else:
+                logger.warning(f"Failed to register resources for {server_name}: {e}")
+    
+    async def read_resource(self, namespaced_uri: str) -> str:
+        """Read content from an MCP resource."""
+        if namespaced_uri not in self.resources:
+            raise ValueError(f"Resource not found: {namespaced_uri}")
+        
+        resource = self.resources[namespaced_uri]
+        session = self.servers.get(resource.server_name)
+        
+        if not session:
+            raise RuntimeError(f"MCP server '{resource.server_name}' is unavailable")
+        
+        try:
+            result = await session.read_resource(uri=resource.uri)
+            
+            if not result.contents:
+                return f"Resource '{resource.name}' is empty"
+            
+            texts: List[str] = []
+            for item in result.contents:
+                text = getattr(item, "text", None)
+                if text is not None:
+                    texts.append(str(text))
+                else:
+                    uri = getattr(item, "uri", None)
+                    if uri:
+                        texts.append(f"[[Resource URI: {uri}]]")
+                    else:
+                        tname = getattr(item, "type", type(item).__name__)
+                        texts.append(f"[[{tname} content]]")
+            
+            return "\n".join(texts) if texts else str(result.contents)
+            
+        except Exception as e:
+            logger.error(f"Resource read failed for {namespaced_uri}: {e}", exc_info=True)
+            raise
+    
     async def _cleanup_failed_server(self, session: Optional[ClientSession], transport_ctx: Optional[Any]) -> None:
         if session:
             try:
@@ -279,11 +437,19 @@ class MCPManager:
             except Exception as e:
                 logger.debug(f"Error cleaning up transport: {e}")
 
-    def server_summaries(self) -> List[Tuple[str, int]]:
-        counts: Dict[str, int] = {}
+    def server_summaries(self) -> List[Tuple[str, int, int]]:
+        """Return (server_name, tool_count, resource_count) for each server."""
+        tool_counts: Dict[str, int] = {}
+        resource_counts: Dict[str, int] = {}
+        
         for server_name, _, _ in self.tools.values():
-            counts[server_name] = counts.get(server_name, 0) + 1
-        return list(counts.items())
+            tool_counts[server_name] = tool_counts.get(server_name, 0) + 1
+        
+        for resource in self.resources.values():
+            resource_counts[resource.server_name] = resource_counts.get(resource.server_name, 0) + 1
+        
+        all_servers = set(tool_counts.keys()) | set(resource_counts.keys())
+        return [(s, tool_counts.get(s, 0), resource_counts.get(s, 0)) for s in sorted(all_servers)]
 
     async def stop(self) -> None:
         for name, session in self.servers.items():
@@ -326,7 +492,10 @@ class MCPManager:
         except Exception as e:
             logger.error(f"Tool execution failed for {namespaced}: {e}", exc_info=True)
             raise
-
+    
+    def find_similar_tools(self, tool_name: str, n: int = 3) -> List[str]:
+        """Find similar tool names for suggestions."""
+        return get_close_matches(tool_name, self.tools.keys(), n=n, cutoff=0.6)
 
 
 class OpenAICompatibleLLM:
@@ -367,7 +536,8 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.config.model,
             "stream": True,
-            "messages": messages
+            "messages": messages,
+            "stream_options": {"include_usage": True}  # Get token usage
         }
         if tools:
             payload["tools"] = tools
@@ -397,7 +567,6 @@ class OpenAICompatibleLLM:
                 yield json.loads(data)
 
 
-
 class Chat:
     
     def __init__(
@@ -416,6 +585,7 @@ class Chat:
         ]
         self.batch_counter = 0
         self.tool_sem = asyncio.Semaphore(config.max_parallel_tools)
+        self.usage = UsageStats()
 
     async def turn(self, user_input: str) -> None:
         self._add_user_message(user_input)
@@ -447,7 +617,15 @@ class Chat:
         tools_schema = [schema for _, _, schema in self.mcp.tools.values()]
         
         async for chunk in self.llm.stream_chat(self.messages, tools_schema):
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            # Extract usage if present (final chunk)
+            if "usage" in chunk:
+                self.usage.update(chunk.get("usage"))
+            
+            # Some provider events (e.g., usage-only) may include no choices
+            choices = chunk.get("choices")
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}) or {}
             
             content = delta.get("content")
             if content:
@@ -617,43 +795,75 @@ class Chat:
 
         # Display sync results first
         for tc_id, msg in sync_results:
-            index = display_ids.get(tc_id, 0)
-            content = msg.get("content", "")
-            is_error = "Error:" in content
-            preview = self._preview_content(content)
-            self.ui.tool_result_item(Color.ASSISTANT, index, preview, is_error)
+            self._display_single_result(tc_id, msg, display_ids)
 
         # Stream async results as they complete
         results = sync_results.copy()
         for coro in asyncio.as_completed(tasks_map.keys()):
             tc_id, msg = await coro
             results.append((tc_id, msg))
-            
-            index = display_ids.get(tc_id, 0)
-            content = msg.get("content", "")
-            is_error = "Error:" in content
-            preview = self._preview_content(content)
-            self.ui.tool_result_item(Color.ASSISTANT, index, preview, is_error)
+            self._display_single_result(tc_id, msg, display_ids)
 
         if tasks_map or sync_results:
             self.ui.tool_batch_footer(Color.ASSISTANT, Color.TOOL_RESULT)
 
         return results
 
+    def _display_single_result(self, tc_id: str, msg: Message, display_ids: Dict[str, int]) -> None:
+        """Display a single tool result with structured formatting."""
+        index = display_ids.get(tc_id, 0)
+        content = msg.get("content", "")
+        is_error = "Error:" in content
+        
+        # Try structured rendering for non-error content
+        if not is_error and ('{' in content or '\t' in content or '|' in content):
+            # Check if it looks like structured data
+            try:
+                # Use a temporary approach - just check first line
+                first_line = content.split('\n')[0]
+                if first_line.strip().startswith('{') or '\t' in first_line or '|' in first_line:
+                    # Render with structure
+                    tag = f"[{Color.TOOL_RESULT.value}][{index:02d}][/{Color.TOOL_RESULT.value}]"
+                    self.ui.console.print(f"{self.ui.nested_prefix(Color.ASSISTANT, Color.TOOL_RESULT)}{tag}")
+                    self.ui.render_structured_data(Color.ASSISTANT, content)
+                    return
+            except:
+                pass
+        
+        # Fall back to preview
+        preview = self._preview_content(content)
+        self.ui.tool_result_item(Color.ASSISTANT, index, preview, is_error)
+
     def _validate_tool_call(self, tc_id: str, name: str, display_ids: Dict[str, int]) -> Optional[Message]:
-        """Validate tool call and return error message if invalid."""
+        """Validate tool call and return error message with suggestions if invalid."""
         if not name:
-            self.ui.error(Color.ASSISTANT, "Missing function name for tool call")
-            return self._create_error_message(tc_id, "Missing function name")
+            error = "Missing function name for tool call"
+            self.ui.error(Color.ASSISTANT, error)
+            return self._create_error_message(tc_id, error)
 
         if name not in self.mcp.tools:
-            self.ui.error(Color.ASSISTANT, f"Unknown tool name: '{name}'")
-            return self._create_error_message(tc_id, f"Unknown tool: '{name}'")
+            # Find similar tools
+            similar = self.mcp.find_similar_tools(name)
+            
+            error_parts = [f"Unknown tool: '{name}'"]
+            if similar:
+                error_parts.append(f"Did you mean: {', '.join(similar)}?")
+            else:
+                # Show available tools from same server if possible
+                server_prefix = name.split('_')[0] if '_' in name else None
+                if server_prefix:
+                    matching = [t for t in self.mcp.tools.keys() if t.startswith(f"{server_prefix}_")]
+                    if matching:
+                        error_parts.append(f"Available from {server_prefix}: {', '.join(matching[:5])}")
+            
+            error = " | ".join(error_parts)
+            self.ui.error(Color.ASSISTANT, error)
+            return self._create_error_message(tc_id, error)
 
         return None
 
     def _create_error_message(self, tc_id: str, error: str) -> Message:
-        """Create error tool message."""
+        """Create detailed error tool message."""
         return {
             "role": "tool",
             "tool_call_id": tc_id,
@@ -661,13 +871,14 @@ class Chat:
         }
 
     async def _execute_single_tool(self, tc_id: str, name: str, arguments: str) -> Tuple[str, Message]:
-        """Execute single tool with semaphore limiting."""
+        """Execute single tool with detailed error handling."""
         async with self.tool_sem:
             try:
                 args = json.loads(arguments) if arguments else {}
             except Exception as e:
-                logger.warning(f"Invalid JSON arguments for {name}: {e}")
-                return tc_id, self._create_error_message(tc_id, f"Invalid JSON: {e}")
+                error = f"Invalid JSON arguments: {e}"
+                logger.warning(f"{name}: {error}")
+                return tc_id, self._create_error_message(tc_id, error)
 
             try:
                 result = await self.mcp.call_tool(name, args)
@@ -678,8 +889,11 @@ class Chat:
                     "content": content
                 }
             except Exception as e:
-                logger.error(f"Tool execution failed for {name}: {e}")
-                return tc_id, self._create_error_message(tc_id, str(e))
+                # Enhanced error with context
+                server_name = self.mcp.tools[name][0]
+                error = f"Execution failed on server '{server_name}': {str(e)}"
+                logger.error(f"{name}: {error}")
+                return tc_id, self._create_error_message(tc_id, error)
 
     def _truncate_content(self, content: str) -> str:
         """Intelligently truncate content at natural boundaries."""
@@ -713,11 +927,7 @@ class Chat:
         self.ui.tool_results_header(Color.ASSISTANT, Color.TOOL_RESULT)
 
         for tc_id, msg in results:
-            index = display_ids.get(tc_id, 0)
-            content = msg.get("content", "")
-            is_error = "Error:" in content
-            preview = self._preview_content(content)
-            self.ui.tool_result_item(Color.ASSISTANT, index, preview, is_error)
+            self._display_single_result(tc_id, msg, display_ids)
 
         self.ui.tool_batch_footer(Color.ASSISTANT, Color.TOOL_RESULT)
 
@@ -732,19 +942,247 @@ class Chat:
         """Reset conversation to initial state."""
         self.messages = [self.messages[0]]
         self.batch_counter = 0
+        self.usage = UsageStats()
+    
+    def save_conversation(self, filename: Optional[str] = None) -> Path:
+        """Save conversation to file."""
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"conversation_{timestamp}.json"
+        
+        filepath = self.config.save_dir / filename
+        
+        data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": self.config.model,
+            "usage": {
+                "prompt_tokens": self.usage.prompt_tokens,
+                "completion_tokens": self.usage.completion_tokens,
+                "total_tokens": self.usage.total_tokens,
+                "estimated_cost": self.usage.cost_estimate(self.config.model)
+            },
+            "messages": self.messages
+        }
+        
+        filepath.write_text(json.dumps(data, indent=2))
+        return filepath
+    
+    def load_conversation(self, filename: str) -> None:
+        """Load conversation from file."""
+        filepath = self.config.save_dir / filename
+        
+        if not filepath.exists():
+            raise FileNotFoundError(f"Conversation file not found: {filepath}")
+        
+        data = json.loads(filepath.read_text())
+        
+        self.messages = data["messages"]
+        
+        # Restore usage stats if available
+        if "usage" in data:
+            usage = data["usage"]
+            self.usage.prompt_tokens = usage.get("prompt_tokens", 0)
+            self.usage.completion_tokens = usage.get("completion_tokens", 0)
+            self.usage.total_tokens = usage.get("total_tokens", 0)
 
+
+class CommandHandler:
+    """Handle slash commands for power user features."""
+    
+    COMMANDS = {
+        "/help": "Show available commands",
+        "/tools": "List all available tools",
+        "/resources": "List all available resources",
+        "/servers": "Show server status",
+        "/token": "Show token usage and cost",
+        "/save": "Save conversation (optional: filename)",
+        "/load": "Load conversation (requires: filename)",
+        "/list": "List saved conversations",
+        "/clear": "Reset conversation",
+        "/exit": "Exit the client",
+    }
+    
+    def __init__(self, chat: Chat, mcp: MCPManager, ui: UI, console: Console):
+        self.chat = chat
+        self.mcp = mcp
+        self.ui = ui
+        self.console = console
+    
+    def is_command(self, text: str) -> bool:
+        """Check if input is a command."""
+        return text.strip().startswith("/")
+    
+    async def handle(self, command: str) -> bool:
+        """Handle command. Returns True if should exit."""
+        parts = command.strip().split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+        
+        if cmd == "/help":
+            self._show_help()
+        elif cmd == "/tools":
+            self._show_tools()
+        elif cmd == "/resources":
+            self._show_resources()
+        elif cmd == "/servers":
+            self._show_servers()
+        elif cmd == "/token":
+            self._show_token_usage()
+        elif cmd == "/save":
+            self._save_conversation(arg)
+        elif cmd == "/load":
+            self._load_conversation(arg)
+        elif cmd == "/list":
+            self._list_conversations()
+        elif cmd == "/clear":
+            self._clear_conversation()
+        elif cmd in ("/exit", "/quit"):
+            return True
+        else:
+            self.ui.error(Color.INFO, f"Unknown command: {cmd}")
+            self._show_help()
+        
+        return False
+    
+    def _show_help(self) -> None:
+        """Display available commands."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Available Commands")
+        
+        for cmd, desc in self.COMMANDS.items():
+            self.ui.info(Color.INFO, f"  {cmd:<15} {desc}")
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _show_tools(self) -> None:
+        """List all available tools grouped by server."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Available Tools")
+        
+        # Group tools by server
+        by_server: Dict[str, List[str]] = {}
+        for tool_name, (server_name, original, _) in self.mcp.tools.items():
+            by_server.setdefault(server_name, []).append(f"{tool_name} ({original})")
+        
+        for server, tools in sorted(by_server.items()):
+            self.ui.info(Color.INFO, f"\n[bold]{server}:[/bold] ({len(tools)} tools)")
+            for tool in sorted(tools):
+                self.ui.info(Color.INFO, f"  • {tool}")
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _show_resources(self) -> None:
+        """List all available resources grouped by server."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Available Resources")
+        
+        if not self.mcp.resources:
+            self.ui.info(Color.INFO, "  No resources available")
+        else:
+            # Group resources by server
+            by_server: Dict[str, List[MCPResource]] = {}
+            for resource in self.mcp.resources.values():
+                by_server.setdefault(resource.server_name, []).append(resource)
+            
+            for server, resources in sorted(by_server.items()):
+                self.ui.info(Color.INFO, f"\n[bold]{server}:[/bold] ({len(resources)} resources)")
+                for res in sorted(resources, key=lambda r: r.name):
+                    desc = f" - {res.description}" if res.description else ""
+                    self.ui.info(Color.INFO, f"  • {res.name} ({res.uri}){desc}")
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _show_servers(self) -> None:
+        """Show server status."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Server Status")
+        
+        for server, tool_count, resource_count in self.mcp.server_summaries():
+            status = "✓" if server in self.mcp.servers else "✗"
+            self.ui.info(
+                Color.INFO,
+                f"  [{status}] {server}: {tool_count} tools, {resource_count} resources"
+            )
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _show_token_usage(self) -> None:
+        """Display token usage and cost estimate."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Token Usage")
+        
+        summary = self.chat.usage.format_summary(self.chat.config.model)
+        self.ui.info(Color.INFO, f"  {summary}")
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _save_conversation(self, filename: Optional[str]) -> None:
+        """Save current conversation."""
+        try:
+            filepath = self.chat.save_conversation(filename)
+            self.ui.success(Color.INFO, f"Saved to: {filepath}")
+        except Exception as e:
+            self.ui.error(Color.INFO, f"Save failed: {e}")
+    
+    def _load_conversation(self, filename: Optional[str]) -> None:
+        """Load a saved conversation."""
+        if not filename:
+            self.ui.error(Color.INFO, "Filename required: /load <filename>")
+            return
+        
+        try:
+            self.chat.load_conversation(filename)
+            self.ui.success(Color.INFO, f"Loaded: {filename}")
+            self._show_token_usage()
+        except FileNotFoundError:
+            self.ui.error(Color.INFO, f"File not found: {filename}")
+            self._list_conversations()
+        except Exception as e:
+            self.ui.error(Color.INFO, f"Load failed: {e}")
+    
+    def _list_conversations(self) -> None:
+        """List saved conversations."""
+        self.ui.delimiter(Color.INFO)
+        self.ui.label(Color.INFO, "Saved Conversations")
+        
+        save_dir = self.chat.config.save_dir
+        files = sorted(save_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        
+        if not files:
+            self.ui.info(Color.INFO, "  No saved conversations")
+        else:
+            for filepath in files:
+                size = filepath.stat().st_size
+                mtime = datetime.fromtimestamp(filepath.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                self.ui.info(Color.INFO, f"  • {filepath.name} ({size:,} bytes, {mtime})")
+        
+        self.ui.delimiter(Color.INFO)
+    
+    def _clear_conversation(self) -> None:
+        """Clear current conversation."""
+        self.chat.reset()
+        self.ui.success(Color.INFO, "Conversation cleared")
 
 
 async def run_repl(config: AppConfig, console: Console) -> None:
     ui = UI(console)
     
     async with MCPManager(config, console) as mcp:
-        if not mcp.tools:
-            console.print("[red]No tools available. Check config.[/red]")
+        if not mcp.tools and not mcp.resources:
+            console.print("[red]No tools or resources available. Check config.[/red]")
             return
         
-        info_lines = [f"✓ {name}: {count} tools" for name, count in mcp.server_summaries()]
-        info_lines.append("Type 'exit' to quit, 'clear' to reset")
+        info_lines = []
+        for name, tool_count, resource_count in mcp.server_summaries():
+            parts = []
+            if tool_count:
+                parts.append(f"{tool_count} tools")
+            if resource_count:
+                parts.append(f"{resource_count} resources")
+            info_lines.append(f"✓ {name}: {', '.join(parts)}")
+        
+        info_lines.append("Type '/help' for commands, '/exit' to quit")
+        
         ui.banner(
             Color.ASSISTANT,
             "TinyClient",
@@ -754,6 +1192,7 @@ async def run_repl(config: AppConfig, console: Console) -> None:
 
         llm = OpenAICompatibleLLM(config)
         chat = Chat(config, mcp, llm, ui)
+        commands = CommandHandler(chat, mcp, ui, console)
 
         try:
             while True:
@@ -766,21 +1205,24 @@ async def run_repl(config: AppConfig, console: Console) -> None:
                 if not user_input.strip():
                     continue
 
-                if user_input.lower() in ("exit", "quit"):
-                    break
+                ui.delimiter(Color.USER)
 
-                if user_input.lower() == "clear":
-                    chat.reset()
-                    ui.text(Color.USER, "Cleared")
-                    ui.delimiter(Color.USER)
+                # Handle commands
+                if commands.is_command(user_input):
+                    should_exit = await commands.handle(user_input)
+                    if should_exit:
+                        break
                     continue
 
-                ui.delimiter(Color.USER)
-                await chat.turn(user_input)
+                # Normal chat turn
+                try:
+                    await chat.turn(user_input)
+                except Exception as e:
+                    logger.error(f"Chat turn failed: {e}", exc_info=True)
+                    ui.error(Color.ASSISTANT, f"Chat failed: {e}")
 
         finally:
             await llm.aclose()
-
 
 
 async def main() -> None:
@@ -806,14 +1248,18 @@ async def main() -> None:
     repl_task = asyncio.create_task(run_repl(config, console))
     stopper = asyncio.create_task(stop.wait())
 
-    await asyncio.wait([repl_task, stopper], return_when=asyncio.FIRST_COMPLETED)
+    done, pending = await asyncio.wait([repl_task, stopper], return_when=asyncio.FIRST_COMPLETED)
 
-    if not repl_task.done():
+    # If stop was triggered but REPL is still running, cancel it gracefully
+    if stopper in done and not repl_task.done():
         repl_task.cancel()
         try:
             await repl_task
         except asyncio.CancelledError:
             pass
+    # If REPL completed, ensure stopper is not left pending
+    for task in pending:
+        task.cancel()
 
 
 if __name__ == "__main__":
